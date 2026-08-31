@@ -79,8 +79,12 @@ on:
         required: false
         default: ""
       # 增量半成品：把已编译的 build_dir/staging_dir（toolchain+host+已构建包）缓存到
-      # 同仓库的 Release（semi-<srcRef>-<target>-<subtarget>）。下次同分支仅在配置里
-      # 加插件时，恢复半成品后 make 只重编新增包，几分钟~二十分钟即可出新固件。
+      # 独立仓库（默认同仓库，可指定 semiRepo）的 Release（semi-<srcRef>-<target>-<subtarget>）。
+      # 下次同分支仅在配置里加插件时，恢复半成品后 make 只重编新增包，几分钟~二十分钟即可出新固件。
+      semiRepo:
+        description: 半成品缓存仓库(owner/repo)，留空=本仓库。跨仓库需配 secret SEMI_GH_TOKEN(PAT 对半成品仓库有写权限)
+        required: false
+        default: ""
       semiRelease:
         description: 半成品缓存 Release tag（恢复用，需有对应资产，可空）
         required: false
@@ -185,12 +189,17 @@ jobs:
       - name: 恢复增量半成品（可选，命中则加插件只需重编新增包）
         if: github.event.inputs.semiRelease != ''
         shell: bash
+        env:
+          # 跨仓库恢复需要对该仓库有 read 权限的 PAT；同仓库(留空)用默认 github.token 即可
+          GH_TOKEN: ${{ secrets.SEMI_GH_TOKEN || github.token }}
         run: |
           set -e
-          echo "== 下载半成品 Release ${{ inputs.semiRelease }} 至 BUILD_DIR=$BUILD_DIR"
+          SEMI_REPO="${{ inputs.semiRepo }}"
+          [ -z "$SEMI_REPO" ] && SEMI_REPO="$GITHUB_REPOSITORY"
+          echo "== 下载半成品 Release ${{ inputs.semiRelease }} ($SEMI_REPO) 至 BUILD_DIR=$BUILD_DIR"
           mkdir -p /tmp/semi && rm -rf /tmp/semi/*
           gh release download "${{ inputs.semiRelease }}" \
-            --repo "$GITHUB_REPOSITORY" \
+            --repo "$SEMI_REPO" \
             --pattern 'semi-*.part*' \
             --dir /tmp/semi --clobber 2>/dev/null || { echo "!! 半成品无资产，回退全量编译"; exit 0; }
           ls -la /tmp/semi/
@@ -342,17 +351,22 @@ jobs:
           echo "== release assets =="
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' || true
 
-      # 回传增量半成品：把构建中间产物打包并切分卷（≤2GB/asset）发布到 semi-<...> Release。
-      # 供下一轮同分支仅加插件的增量构建恢复，实现"加插件几分钟出新固件"。
+      # 回传增量半成品：把构建中间产物打包并切分卷（≤2GB/asset）发布到半成品仓库的
+      # semi-<...> Release。供下一轮同分支仅加插件的增量构建恢复，实现"加插件几分钟出新固件"。
       - name: 回传增量半成品（可选）
         if: success() && github.event.inputs.saveSemi == 'true'
         shell: bash
+        env:
+          # 跨仓库回传需要对该仓库有写权限的 PAT；同仓库(留空)用默认 github.token 即可
+          GH_TOKEN: ${{ secrets.SEMI_GH_TOKEN || github.token }}
         run: |
           set -e
+          SEMI_REPO="${{ inputs.semiRepo }}"
+          [ -z "$SEMI_REPO" ] && SEMI_REPO="$GITHUB_REPOSITORY"
           SEMI_TAG="semi-${{ inputs.srcRef }}-${{ inputs.target }}"
           CHUNK_MB="${{ inputs.semiChunkMB }}"
           [ -z "$CHUNK_MB" ] && CHUNK_MB=1500
-          echo "== 打包半成品 -> $SEMI_TAG (chunk=${CHUNK_MB}MB) =="
+          echo "== 打包半成品 -> $SEMI_REPO/$SEMI_TAG (chunk=${CHUNK_MB}MB) =="
           du -sh "$BUILD_DIR"/staging_dir "$BUILD_DIR"/build_dir 2>/dev/null || { echo "!! 无半成品目录可回传"; exit 0; }
           mkdir -p /tmp/semiout && rm -rf /tmp/semiout/*
           # 只保留关键中间产物：staging_dir(含 toolchain+host+已构建包) + build_dir(各包编译目录)
@@ -365,17 +379,17 @@ jobs:
           cd /tmp/semiout
           split -b "${CHUNK_MB}m" -d -a 3 --additional-suffix=.part semi.tar.gz semi-
           ls -la /tmp/semiout/
-          # 幂等发布
-          if gh release view "$SEMI_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          # 幂等发布到半成品仓库
+          if gh release view "$SEMI_TAG" --repo "$SEMI_REPO" >/dev/null 2>&1; then
             echo "== release $SEMI_TAG 存在：删除旧资产后重传 =="
-            gh release delete "$SEMI_TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+            gh release delete "$SEMI_TAG" --repo "$SEMI_REPO" --yes --cleanup-tag 2>/dev/null || true
           fi
           gh release create "$SEMI_TAG" \
-            --repo "$GITHUB_REPOSITORY" /tmp/semiout/semi-*.part \
+            --repo "$SEMI_REPO" /tmp/semiout/semi-*.part \
             --title "BuildOS 半成品 ${{ inputs.target }}" \
             --notes "incremental: srcRef=${{ inputs.srcRef }}, target=${{ inputs.target }}. 供增量构建复用 build_dir/staging_dir." \
             --prerelease 2>&1 | tail -5
-          echo "== 半成品已回传 $SEMI_TAG =="
+          echo "== 半成品已回传 $SEMI_REPO/$SEMI_TAG =="
 
       # 兜底 artifact（部分旧流程仍读取该路径；新交付优先走 Release）
       - name: 上传产物
