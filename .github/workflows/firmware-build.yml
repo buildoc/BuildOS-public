@@ -1,0 +1,352 @@
+# ============================================================================
+# BuildOS 固件编译工作流（workflow_dispatch，优化版）
+# ----------------------------------------------------------------------------
+# 由本地主程序触发，云端 runner 装依赖→clone 源码→写 .config/files→make。
+# 产物以 Artifact=<buildCode> 上传，主程序轮询并用 PAT 拉回，经域名下发。
+#
+# 本版相对旧版的关键优化（把首次/二次编译从 ~100min 降到 ~55min，增量更快）：
+#  1) ccache 无条件启用，按 分支+target 分桶缓存并跨 build 复用（旧版因
+#     if: configB64=='' 而永不生效 → 每次冷编译）
+#  2) CCACHE_DIR / CONFIG_CCACHE_DIR 显式对齐到 runner.temp/ccache
+#     （OpenWrt rules.mk 会以 CONFIG_CCACHE_DIR 覆盖环境变量，必须写进 .config）
+#  3) dl/(下载的包源码) 缓存复用，避免每次重新下载
+#  4) tools/ 串行编译后，再 make -j 并行全量（避免 ccache 包装器竞态）
+#  5) 支持 incremental=true 的增量精简：仅改配置/加包时，命中上一次 ccache 与 dl，
+#     只重编受影响包，几分钟~二十分钟即可出新固件
+#
+# 前置：私有源码/私有 feed 需 secrets.REPO_WRITE_PAT(Contents:read)；
+#       触发用 PAT 需 Actions:read/write + Workflows:read。
+# 注意：仓库若开启 main 分支保护(禁止 force-push)，clean-history 会被拒，
+#       需关闭分支保护或改由保留历史。
+# ============================================================================
+name: firmware-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      buildCode:
+        description: 构建标识
+        required: true
+      srcRepo:
+        description: OpenWrt 源码仓库 git 地址
+        required: false
+        default: https://github.com/openwrt/openwrt.git
+      srcRef:
+        description: 源码分支或 Tag（gitBranch）
+        required: false
+        default: master
+      deviceLabel:
+        description: 设备标签
+        required: false
+        default: unknown
+      target:
+        description: target/subtarget
+        required: false
+        default: ""
+      profile:
+        description: profile
+        required: false
+        default: ""
+      openwrtRelease:
+        required: false
+        default: ""
+      plugins:
+        required: false
+        default: ""
+      configOptions:
+        required: false
+        default: ""
+      luciLanguage:
+        required: false
+        default: zh_Hans
+      # 增量：true=基于上次成功构建只重编变更包；假=全量
+      incremental:
+        description: 增量构建
+        required: false
+        default: "false"
+      configB64:
+        description: .config 内容(base64)
+        required: false
+        default: ""
+      filesB64:
+        description: files/ tar.gz(base64)
+        required: false
+        default: ""
+      # 离线加速：填 offline-prefetch 产出的 Release tag，装配仓库预热好的 dl/feeds，跳过联网
+      offlineRelease:
+        description: 离线包 Release tag（offline-prefetch 生成）
+        required: false
+        default: ""
+
+concurrency:
+  group: ${{ github.event.inputs.buildCode }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  OPENWRT_REPO: ${{ inputs.srcRepo }}
+  OPENWRT_BRANCH: ${{ inputs.srcRef }}
+  BUILD_DIR: buildos-src
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # 需要 contents: write 才能在构建成功后把镜像发布成本仓库的 GitHub Release
+    permissions:
+      contents: write
+    steps:
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -y
+          # Ubuntu 24.04 移除 python3-distutils；python3-setuptools 提供 import distutils 兼容
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ccache gawk gettext git python3 python3-setuptools python3-pyelftools python3-pip \
+            file subversion libncurses5-dev zlib1g-dev libssl-dev flex bison g++ bzip2 \
+            unzip wget rsync libtool autoconf curl time perl
+          echo deps-ok
+
+      - name: 缓存 ccache（按 分支+target 分桶，跨配置可回退复用）
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-${{ inputs.srcRef }}-${{ inputs.target }}
+          restore-keys: |
+            ccache-${{ inputs.srcRef }}-
+            ccache-
+
+      - name: 缓存 dl 包源码（按分支复用，免重复下载）
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/dl
+          key: dl-${{ inputs.srcRef }}
+          restore-keys: |
+            dl-
+
+      # 离线加速：提供 offlineRelease 时，先装配仓库里预热好的离线包（dl/ + feeds/）
+      - name: 装配离线包（可选，跳过联网下载）
+        if: github.event.inputs.offlineRelease != ''
+        shell: bash
+        run: |
+          mkdir -p "${{ runner.temp }}/dl" "$(dirname "$BUILD_DIR")/bundle"
+          gh release download "${{ inputs.offlineRelease }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'offline-*.tar.gz' \
+            --dir /tmp/offline --clobber 2>/dev/null || { echo "无离线资产，回退在线"; exit 0; }
+          tar -xzpf /tmp/offline/offline-*.tar.gz -C "$(dirname "$BUILD_DIR")/bundle"
+          if [ -d "$(dirname "$BUILD_DIR")/bundle/dl" ]; then
+            cp -an "$(dirname "$BUILD_DIR")/bundle/dl/." "${{ runner.temp }}/dl/" || true
+          fi
+          echo "OFFLINE_DIR=$(dirname "$BUILD_DIR")/bundle" >> "$GITHUB_ENV"
+
+      # runner.temp 只在 step 上下文可用，故用 $GITHUB_ENV 固化为本 job 的 CCACHE_* 环境变量
+      - name: 设置 ccache 环境
+        run: |
+          echo "CCACHE_DIR=${{ runner.temp }}/ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=4G" >> "$GITHUB_ENV"
+          echo "config ccache env ok"
+
+      - name: 克隆源码
+        run: |
+          git clone --depth=1 -b "$OPENWRT_BRANCH" "$OPENWRT_REPO" "$BUILD_DIR" 2>/dev/null || \
+            git clone -b "$OPENWRT_BRANCH" "$OPENWRT_REPO" "$BUILD_DIR" 2>/dev/null || \
+            git clone "$OPENWRT_REPO" "$BUILD_DIR"
+          echo "== source $(git -C $BUILD_DIR rev-parse --short HEAD)"
+          # dl/ 指到缓存目录：包源码与 ccache 一样跨构建持久，避免重复下载
+          # 必须先建好 runner.temp/dl 再 ln，否则缓存未命中时 dl 是悬空链接，
+          # OpenWrt 下载包时 mkdir -p dl 会因 dl 已存在而报 "File exists"（见 tools/xz）
+          mkdir -p "${{ runner.temp }}/dl"
+          ln -sfn "${{ runner.temp }}/dl" "$BUILD_DIR/dl" && echo "== dl -> runner.temp/dl"
+
+      - name: 写入配置
+        run: |
+          cd "$BUILD_DIR"
+          if [ -n "${{ inputs.configB64 }}" ]; then
+            echo "${{ inputs.configB64 }}" | base64 -d > /tmp/user-config
+            # 校验：必须是纯文本且含 CONFIG_ 行；否则丢弃，由 make defconfig 生成默认配置
+            if LC_ALL=C grep -q $'\x00' /tmp/user-config 2>/dev/null; then
+              echo "WARN: configB64 含二进制内容，已忽略"; rm -f /tmp/user-config
+            elif grep -q "^CONFIG_" /tmp/user-config 2>/dev/null; then
+              cp /tmp/user-config .config && echo "OK: 使用用户配置"
+            else
+              echo "WARN: configB64 无有效 CONFIG_ 行，已忽略"; rm -f /tmp/user-config
+            fi
+          fi
+          if [ -n "${{ inputs.filesB64 }}" ]; then
+            echo "${{ inputs.filesB64 }}" | base64 -d > /tmp/files.tgz
+            mkdir -p files && tar -xzf /tmp/files.tgz -C files
+          fi
+
+      - name: feeds 更新
+        shell: bash
+        run: |
+          cd "$BUILD_DIR"
+          # 离线加速：若离线包含 feeds，先并入，让 feeds install 直接用已下载的源，不联网
+          if [ -n "$OFFLINE_DIR" ] && [ -d "$OFFLINE_DIR/feeds" ]; then
+            echo "== 使用离线 feeds =="
+            cp -an "$OFFLINE_DIR/feeds/." feeds/ 2>/dev/null || true
+            ./scripts/feeds install -a > /tmp/feeds-install.log 2>&1
+            echo "== feeds install(offline) exit=$?"
+            tail -15 /tmp/feeds-install.log
+          else
+            ./scripts/feeds update -a > /tmp/feeds.log 2>&1
+            echo "== feeds update exit=$?"
+            tail -20 /tmp/feeds.log
+            ./scripts/feeds install -a > /tmp/feeds-install.log 2>&1
+            echo "== feeds install exit=$?"
+            tail -20 /tmp/feeds-install.log
+          fi
+
+      - name: 生成 config（含 prereq 检查，完整输出缺项）
+        shell: bash
+        run: |
+          cd "$BUILD_DIR"
+          # —— 目标符号注入：从 inputs.target / inputs.profile 推导并写进 .config ——
+          # configB64 未传或缺失 target 行时，make defconfig 会退回源码默认目标（往往
+          # 是 ath79 默认 profile，整个构建就白跑）。这里按 OpenWrt Kconfig 惯例补全
+          #  board/subtarget/profile 符号，保证真按所选设备出镜像。已有行不重复追加
+          # （幂等，兼容 configB64 携带正确 target 的完整配置）。
+          if [ -n "${{ inputs.target }}" ]; then
+            IN_BOARD="$(echo '${{ inputs.target }}' | cut -d/ -f1)"
+            IN_SUB="$(echo '${{ inputs.target }}' | cut -d/ -f2)"
+            [ -z "$IN_SUB" ] && IN_SUB="$IN_BOARD"
+            S_BOARD="$(echo "$IN_BOARD" | sed 's/[^A-Za-z0-9_]/_/g')"
+            S_SUB="$(echo "$IN_SUB" | sed 's/[^A-Za-z0-9_]/_/g')"
+            grep -q "CONFIG_TARGET_${S_BOARD}=y" .config 2>/dev/null || echo "CONFIG_TARGET_${S_BOARD}=y" >> .config
+            grep -q "CONFIG_TARGET_${S_BOARD}_${S_SUB}=y" .config 2>/dev/null || echo "CONFIG_TARGET_${S_BOARD}_${S_SUB}=y" >> .config
+            if [ -n "${{ inputs.profile }}" ]; then
+              # 设备选择用 target 的 "Target Profile" 项：CONFIG_TARGET_<board>_<sub>_DEVICE_<设备名>=y。
+              # config.buildinfo 里出现的 CONFIG_TARGET_DEVICE_<b>_<s>_DEVICE_<设备>，是 defconfig
+              # 解析后"要构建的设备"结果符号，手动设置它无效(会被忽略/回退默认第一个设备)。
+              # 设备名按源码原样保留（连字符不转换）。
+              PR_DEV="${{ inputs.profile }}"
+              grep -q "CONFIG_TARGET_${S_BOARD}_${S_SUB}_DEVICE_${PR_DEV}=y" .config 2>/dev/null || \
+                echo "CONFIG_TARGET_${S_BOARD}_${S_SUB}_DEVICE_${PR_DEV}=y" >> .config
+              echo "== 目标注入: CONFIG_TARGET_${S_BOARD}=y / ..._${S_SUB}=y / ..._DEVICE_${PR_DEV}=y"
+            else
+              echo "== 目标注入: CONFIG_TARGET_${S_BOARD}=y / ..._${S_SUB}=y（profile 未传）"
+            fi
+          fi
+          # 启用 ccache。注意：OpenWrt rules.mk 会用 := 覆盖环境 CCACHE_DIR，仅采纳
+          # CONFIG_CCACHE_DIR（默认 $(TOPDIR)/.ccache 会落到源码目录且无人缓存）。
+          # 故必须在 .config 里显式指到 runner.temp/ccache 并预建目录，cache 才能命中。
+          grep -q '^CONFIG_CCACHE=y' .config 2>/dev/null || echo 'CONFIG_CCACHE=y' >> .config
+          mkdir -p "${{ runner.temp }}/ccache"
+          grep -q '^CONFIG_CCACHE_DIR=' .config 2>/dev/null || \
+            echo "CONFIG_CCACHE_DIR=\"${{ runner.temp }}/ccache\"" >> .config
+          echo "== ccache 二进制: $(command -v ccache || echo MISSING)"
+          echo "== ccache 缓存目录(经 CONFIG_CCACHE_DIR): ${{ runner.temp }}/ccache"
+          # 正常跑 prereq 以便真实缺项输出到 log；失败时打印诊断
+          if make defconfig > /tmp/defconfig.log 2>&1; then
+            echo "== defconfig OK =="
+            tail -30 /tmp/defconfig.log
+          else
+            echo "== defconfig FAILED =="
+            tail -60 /tmp/defconfig.log
+            exit 1
+          fi
+
+      - name: 编译
+        run: |
+          cd "$BUILD_DIR"
+          # 先串行编译宿主工具链（含 ccache 包装器），否则 -j 下 xz/expat 等经 ccache
+          # 编译会因包装器尚未生成而竞态失败（openwrt forum: tools/ccache/compile 先行即可）
+          set +e
+          make tools/compile > /tmp/make-tools.log 2>&1
+          T=$?
+          set -e
+          echo "== tools/compile exit=$T =="
+          tail -30 /tmp/make-tools.log
+          if [ $T != 0 ]; then
+            echo "== tools/compile 失败详情 =="
+            grep -inE 'error:|ccache|fatal|no such|failed' /tmp/make-tools.log | tail -30 || true
+            exit 1
+          fi
+          # 并行编译：全量 vs 增量（增量只重编受影响包，命中 ccache 则很快）
+          if [ "${{ inputs.incremental }}" = "true" ]; then
+            echo "== 增量编译（基于上一次 ccache/dl，仅重编差异）build start $(date) =="
+          else
+            echo "== 全量编译 build start $(date) =="
+          fi
+          set +e
+          make -j$(nproc) > /tmp/make.log 2>&1
+          M=$?
+          set -e
+          echo "== make exit=$M =="
+          tail -50 /tmp/make.log
+          if [ $M != 0 ]; then
+            echo "== 失败详情（具体工具/包报错）=="
+            grep -nE 'error:|Error [0-9]|failed to build|No rule|without' /tmp/make.log | tail -40
+          fi
+          test $M = 0
+
+      - name: ccache 统计
+        run: |
+          echo "== ccache 统计（确认缓存已建立）=="
+          CCACHE_DIR="${{ runner.temp }}/ccache" ccache -s 2>/dev/null || echo "(ccache -s 不可用)"
+          du -sh "${{ runner.temp }}/ccache" 2>/dev/null || echo "(ccache 目录为空)"
+
+      - name: 收集产物
+        run: |
+          mkdir -p out
+          find "$BUILD_DIR/bin/targets" -type f \( -name "*.bin" -o -name "*.img.gz" -o -name "*.itb" -o -name "*sha256sums*" \) 2>/dev/null | while read f; do cp -f "$f" out/ 2>/dev/null || true; done
+          echo "== out files:"; ls -la out 2>/dev/null || echo "no out"
+
+      # 直接把镜像发布成本仓库的 GitHub Release（tag=buildos-<buildCode>）。
+      # 反向代理交付：本地零存储，/api/download 直接用 token 代理这些 asset 的下载流。
+      # 与 Actions artifact 相比更持久，且无需服务端落盘回传。
+      - name: 发布构建产物到 Release
+        if: success() && github.event.inputs.buildCode != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd out
+          TAG="buildos-${{ inputs.buildCode }}"
+          set +e
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "== release $TAG 已存在（幂等跳过） =="
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" ./* --clobber
+          else
+            echo "== 创建 release $TAG =="
+            gh release create "$TAG" ./* --repo "$GITHUB_REPOSITORY" \
+              --title "BuildOS ${{ inputs.buildCode }}" \
+              --notes "device=${{ inputs.deviceLabel }}, target=${{ inputs.target }}/${{ inputs.profile }}, release=${{ inputs.openwrtRelease }}" \
+              --prerelease
+          fi
+          echo "== release assets =="
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' || true
+
+      # 兜底 artifact（部分旧流程仍读取该路径；新交付优先走 Release）
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.buildCode }}
+          path: out/
+          if-no-files-found: warn
+          retention-days: 3
+
+  # 成功构建后清空历史：孤儿提交重建 main 并强推（保留 workflow 本身）。
+  # 若仓库开启 main 分支保护(禁止 force-push)，此 job 会失败；可直接删除此 job 来保留历史。
+  clean-history:
+    needs: build
+    if: success() && github.event.inputs.buildCode != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: 重写为孤儿提交并强推
+        shell: bash
+        run: |
+          set -e
+          git config user.name "buildos-cleaner"
+          git config user.email "cleaner@localhost"
+          git checkout --orphan fresh$$
+          git add -A
+          git commit -m "fresh"
+          git branch -M main
+          git push -f origin main
