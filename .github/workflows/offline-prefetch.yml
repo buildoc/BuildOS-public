@@ -1,0 +1,218 @@
+# ============================================================================
+# BuildOS 离线预下载工作流（offline-prefetch）
+# ----------------------------------------------------------------------------
+# 目标：把光口编译里最耗时的“联网下载”段提前做掉，打包成离线资产存本仓库
+#       Release，主编译(firmware-build)提供 offlineRelease=<tag> 时据此离线装配，
+#       跳过 git clone / feeds update / make download 等一切联网，大幅降时延与抖动。
+#
+# 资产形态：
+#   Release tag = offline-<targetSlug>-<srcRefSlug>
+#   资产        = dl/ + feeds/ 打包成的 tar.gz（dl 已含该 target 全部依赖包源码）
+#
+# 使用方法：
+#   1) 先在后台“编译中心”选好目标设备，把起依赖的 configB64 等参数在本工作流里
+#      手工触发一次（或由主程序 dispatch），生成该目标/分支的离线包。
+#   2) 主编译 workflow_dispatch 时传 offlineRelease=<上一步的 tag>，
+#      即可用离线包装配，全程几乎不联网。未传则走原在线路径。
+# ============================================================================
+name: offline-prefetch
+
+on:
+  workflow_dispatch:
+    inputs:
+      srcRepo:
+        description: OpenWrt 源码仓库 git 地址
+        required: false
+        default: https://github.com/openwrt/openwrt.git
+      srcRef:
+        description: 源码分支或 Tag
+        required: false
+        default: v23.05.5
+      target:
+        description: target/subtarget，如 x86/64
+        required: true
+      profile:
+        description: 默认设备 profile
+        required: false
+        default: generic
+      openwrtRelease:
+        required: false
+        default: "23.05"
+      plugins:
+        description: 需预热的插件包名，逗号分隔
+        required: false
+        default: ""
+      luciLanguage:
+        required: false
+        default: zh_Hans
+      # 起依赖 app 会生成的 .config（含 target+plugins+语言），用于 make download 精确预热
+      configB64:
+        description: .config 内容(base64)，留空则按 target 生成
+        required: false
+        default: ""
+      includeFeeds:
+        description: 是否把 feeds 源码也打进离线包（增大会影响体积，建议 true）
+        required: false
+        default: "true"
+
+concurrency:
+  group: offline-${{ inputs.srcRef }}-${{ inputs.target }}
+  cancel-in-progress: false
+
+# 需要 contents: write 创建 Release 上传资产
+permissions:
+  contents: write
+  packages: read
+
+env:
+  OPENWRT_REPO: ${{ inputs.srcRepo }}
+  OPENWRT_BRANCH: ${{ inputs.srcRef }}
+  BUILD_DIR: buildos-src
+  TARGET_SLUG: ${{ inputs.target }}
+  SRC_SLUG: ${{ inputs.srcRef }}
+
+jobs:
+  prefetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ccache gawk gettext git python3 python3-setuptools \
+            file subversion libncurses5-dev zlib1g-dev libssl-dev flex bison g++ bzip2 \
+            unzip wget rsync libtool autoconf curl time perl
+          echo deps-ok
+
+      # 归一化 tag 片段（target 的 '/'、'' 换成 '-'；分支的 '.' 简化）
+      - name: 计算离线 tag
+        id: slug
+        run: |
+          TS=$(echo "${{ inputs.target }}" | sed 's#/#-#g; s/ /_/g')
+          SS=$(echo "${{ inputs.srcRef }}" | sed 's#[./]#-#g')
+          TAG="offline-${TS}-${SS}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "== 离线 Release tag: $TAG"
+
+      - name: 克隆源码（全量，保 feeds 缓存能力）
+        run: |
+          git clone --depth=1 -b "$OPENWRT_BRANCH" "$OPENWRT_REPO" "$BUILD_DIR" 2>/dev/null || \
+            git clone -b "$OPENWRT_BRANCH" "$OPENWRT_REPO" "$BUILD_DIR" 2>/dev/null || \
+            git clone "$OPENWRT_REPO" "$BUILD_DIR"
+          echo "== source $(git -C $BUILD_DIR rev-parse --short HEAD)"
+          # dl/ 预建，供 make download 落盘
+          mkdir -p "$BUILD_DIR/dl"
+
+      - name: 写入配置
+        run: |
+          cd "$BUILD_DIR"
+          if [ -n "${{ inputs.configB64 }}" ]; then
+            echo "${{ inputs.configB64 }}" | base64 -d > /tmp/user-config
+            if LC_ALL=C grep -q $'\x00' /tmp/user-config 2>/dev/null; then
+              echo "WARN: configB64 二进制，忽略"; rm -f /tmp/user-config
+            elif grep -q "^CONFIG_" /tmp/user-config 2>/dev/null; then
+              cp /tmp/user-config .config && echo "OK: 使用用户配置"
+            else
+              echo "WARN: configB64 无 CONFIG_ 行，忽略"; rm -f /tmp/user-config
+            fi
+          fi
+          # 没有现成 config 时，按 target 建最小引导 config（仅用于 make download 收敛依赖）
+          if [ ! -f .config ]; then
+            TS="${{ inputs.target }}"
+            BOARD="${TS%%/*}"; SUBT="${TS#*/}"
+            [ -z "$SUBT" ] && SUBT="$(echo "$SUBT" | tr 'A-Z' 'a-z')"
+            {
+              echo "CONFIG_TARGET_${BOARD}=y"
+              [ -n "$SUBT" ] && echo "CONFIG_TARGET_${BOARD}_${SUBT}=y"
+              echo "CONFIG_TARGET_ROOTFS_TARGZ=n"
+              echo 'CONFIG_VERSION_DIST="BuildOS"'
+            } > .config
+            echo "== 引导 config（target=${{ inputs.target }}）=="
+            cat .config
+          fi
+
+      - name: feeds update + install
+        shell: bash
+        run: |
+          cd "$BUILD_DIR"
+          ./scripts/feeds update -a > /tmp/feeds.log 2>&1
+          echo "== feeds update exit=$?"
+          tail -15 /tmp/feeds.log
+          ./scripts/feeds install -a > /tmp/feeds-install.log 2>&1
+          echo "== feeds install exit=$?"
+          tail -15 /tmp/feeds-install.log
+
+      - name: make defconfig（收敛 .config 到 target 完整依赖）
+        shell: bash
+        run: |
+          cd "$BUILD_DIR"
+          make defconfig > /tmp/defconfig.log 2>&1
+          echo "== defconfig exit=$?"
+          tail -20 /tmp/defconfig.log
+
+      - name: 在线下载全部依赖包（核心联网段，预热 dl/）
+        shell: bash
+        run: |
+          cd "$BUILD_DIR"
+          echo "== make download 开始 $(date) =="
+          set +e
+          make download -j$(nproc) > /tmp/download.log 2>&1
+          D=$?
+          set -e
+          echo "== make download exit=$D =="
+          tail -60 /tmp/download.log
+          if [ $D != 0 ]; then
+            echo "== 下载失败依赖明细 =="
+            grep -iE 'download.*fail|curl:|wget:|error|no such' /tmp/download.log | tail -40 || true
+          fi
+          echo "== dl 目录 =="
+          du -sh "$BUILD_DIR/dl"
+          ls "$BUILD_DIR/dl" | head -30
+
+      - name: 打包离线资产
+        shell: bash
+        run: |
+          cd "$BUILD_DIR"
+          # 只打包 dl/ 与 feeds/（源码树目录结构不打包，主流程另 clone 目录骨架，
+          # 或直接提供 feeds update/install 结果。dl 必须带，feeds 按开关）
+          mkdir -p /tmp/bundle
+          echo "== 收集 dl =="
+          cp -a dl /tmp/bundle/dl
+          if [ "${{ inputs.includeFeeds }}" = "true" ]; then
+            echo "== 收集 feeds =="
+            cp -a feeds /tmp/bundle/feeds
+          fi
+          du -sh /tmp/bundle/*
+          echo "== 打包 tar.gz =="
+          cd /tmp/bundle && tar -czf "/tmp/offline-${{ steps.slug.outputs.tag }}.tar.gz" dl feeds 2>/dev/null || \
+            tar -czf "/tmp/offline-${{ steps.slug.outputs.tag }}.tar.gz" dl
+          ls -la /tmp/offline-*.tar.gz
+          du -h /tmp/offline-*.tar.gz
+
+      - name: 校验资产大小（GitHub 资产上限 2GB）
+        shell: bash
+        run: |
+          SIZE=$(stat -c%s /tmp/offline-*.tar.gz)
+          echo "asset size = $SIZE bytes"
+          if [ "$SIZE" -gt 2097152000 ]; then
+            echo "⚠️ 超过 2GB 上限，可能上传失败，建议减小 includeFeeds 或换更精简 target"
+          fi
+
+      - name: 发布到仓库 Release
+        shell: bash
+        run: |
+          TAG="${{ steps.slug.outputs.tag }}"
+          set +e
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "== Release $TAG 已存在，更新资产 =="
+            gh release upload "$TAG" /tmp/offline-*.tar.gz --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            echo "== 创建 Release $TAG =="
+            gh release create "$TAG" /tmp/offline-*.tar.gz --repo "$GITHUB_REPOSITORY" \
+              --title "离线包 ${{ inputs.target }}" \
+              --notes "离线预下载：源码分支=${{ inputs.srcRef }}, target=${{ inputs.target }}/${{ inputs.profile }}, 含 feeds=${{ inputs.includeFeeds }}" \
+              --prerelease
+          fi
+          echo "== 资产清单 =="
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[]|"\(.name) \(.size) bytes"' || true
+          echo "OFFLINE_TAG=$TAG"
